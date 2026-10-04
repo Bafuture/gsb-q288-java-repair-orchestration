@@ -19,6 +19,49 @@ Pair-wise GSB 标注任务仓库（第 17 批 / 288）。
 ./mvnw -q verify
 ```
 
+## 组件说明
+
+实现位于 `src/main/java/com/example/gsb/repair/`，核心概念：
+
+| 类型 | 职责 |
+|------|------|
+| `RepairFlow<T>` | 一个"检测→决策→修复→复核"流程定义（Builder 组装各步骤） |
+| `DetectStep` / `RepairStep` / `VerifyStep` / `RollbackStep` | 四个阶段步骤接口 |
+| `Precondition` | 修复前置条件，不满足时跳过并记录原因 |
+| `VerifyFailurePolicy` | 复核不通过策略：`ROLLBACK`（默认）或 `MARK_FOR_MANUAL` |
+| `RepairOrchestrator` | 编排器：并发执行、按目标串行、断点续跑、统计汇总 |
+| `CheckpointStore` | 检查点存储（`InMemoryCheckpointStore` / `FileCheckpointStore`） |
+| `RepairStats` | 统计：检测问题数、修复数、复核通过数、回滚数、人工介入数等 |
+
+### 使用示例
+
+```java
+RepairFlow<Item> flow = RepairFlow.builder(Item.class, "config-sync", item -> item.id)
+        .detect(item -> item.isConsistent()
+                ? DetectResult.ok()
+                : DetectResult.problem("值不一致"))
+        .precondition((item, ctx) -> item.locked
+                ? PreconditionResult.rejected("对象已锁定，禁止自动修复")
+                : PreconditionResult.ok())
+        .repair((item, ctx) -> item.applyExpected())   // 实现需幂等
+        .verify((item, ctx) -> item.isConsistent())
+        .rollback((item, ctx) -> item.restoreBackup())
+        .verifyFailurePolicy(VerifyFailurePolicy.ROLLBACK) // 或 MARK_FOR_MANUAL
+        .build();
+
+RepairOrchestrator orchestrator =
+        new RepairOrchestrator(new FileCheckpointStore(Path.of("checkpoints")), 8);
+OrchestrationResult result = orchestrator.run(flow, items);
+RepairStats stats = result.stats(); // detectedIssues/repaired/verified/rolledBack/manualRequired...
+```
+
+行为约定：
+
+- 每个成功步骤完成后写入检查点；中断（步骤抛出 `FatalStepException`）后重跑 `run`
+  即可从断点继续，已成功步骤不会重复执行，终态目标整体跳过。
+- 不同目标并行修复（受 `maxConcurrency` 限制），同一目标经 `KeyedLock` 串行。
+- 复核不通过时按策略回滚或标记待人工；前置条件不满足时跳过修复并给出原因。
+
 ## 任务提示词
 
 以下为本题完整的 User Prompt 原文，两次执行必须使用完全相同的文本。
