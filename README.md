@@ -30,3 +30,46 @@ Pair-wise GSB 标注任务仓库（第 17 批 / 288）。
 1. 在本仓库中完成提示词要求的全部内容。
 2. `./mvnw -q verify` 必须通过。
 3. 完成后在所属分支（A 或 B）上提交，产物快照的父提交必须是初始环境快照。
+
+## 实现说明（分支 A）
+
+`com.example.gsb.repair` 包提供一致性校验与修复编排组件，零外部依赖，闭环流程：
+
+```
+检测 DetectionStep → 决策（RepairRule 匹配 + RepairPrecondition 前置条件）
+                  → 修复 RepairAction → 复核 RecheckAction
+                                          ├─通过：VERIFIED
+                                          └─不通过：ROLLBACK（回滚）/ MANUAL（转人工，可配置）
+```
+
+| 需求 | 实现位置 |
+|------|----------|
+| 1 闭环流程 | `Orchestrator`：检测 → 决策 → 修复 → 复核，状态机见 `IssueStatus` |
+| 2 前置条件 | `RepairPrecondition`/`PreconditionResult`：不满足则 `SKIPPED_PRECONDITION` 并记录跳过原因 |
+| 3 幂等修复 | 修复动作须自带幂等守卫（见 `Spy.guardedRepair`）；编排层保证已成功步骤不重复执行，`IdempotentRepairTest` 证明 |
+| 4 复核与回滚 | `RecheckAction` + `RecheckFailurePolicy`（规则级可覆盖全局默认）；回滚缺失时兜底转人工 |
+| 5 并发控制 | `StripedExecutor`：固定线程池限并发度，对象 id 条带锁保证同对象串行、不同对象并行 |
+| 6 中断恢复 | `ProgressStore`：每步完成即落盘（`FileProgressStore` 原子写 properties），重启后终态跳过、`REPAIRED` 从复核继续 |
+| 7 统计 | `RepairStats`：检测问题数 / 修复成功数 / 复核通过数 / 回滚数 / 人工介入数（另含前置条件跳过数） |
+
+最小用法：
+
+```java
+Orchestrator orchestrator = Orchestrator.builder(detectionStep)
+        .addRule(RepairRule.builder("drift")
+                .precondition(issue -> PreconditionResult.ok())
+                .action(ctx -> repair(ctx))
+                .recheck(ctx -> verify(ctx))
+                .rollback(ctx -> undo(ctx))
+                .failurePolicy(RecheckFailurePolicy.ROLLBACK)
+                .build())
+        .progressStore(new FileProgressStore(Path.of("progress.properties")))
+        .parallelism(4)
+        .build();
+OrchestrationReport report = orchestrator.run(List.of("obj-1", "obj-2"));
+report.stats(); // 检测/修复/复核/回滚/人工计数
+```
+
+测试 17 个，覆盖：闭环（`ClosedLoopTest`）、前置条件（`PreconditionTest`）、
+幂等修复（`IdempotentRepairTest`）、复核回滚（`RecheckRollbackTest`）、
+并发控制（`ConcurrencyControlTest`）、中断恢复（`InterruptRecoveryTest`）。
